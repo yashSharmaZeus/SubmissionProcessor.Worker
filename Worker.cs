@@ -1,19 +1,33 @@
 using System.Text;
+using System.Text.Json;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
+using SubmissionProcessor.Worker.Data;
+using SubmissionProcessor.Worker.DTO;
+using SubmissionProcessor.Worker.Enums;
+using SubmissionProcessor.Worker.Helpers;
+using SubmissionProcessor.Worker.Models;
+using SubmissionProcessor.Worker.Services;
 
 namespace SubmissionProcessor.Worker;
 
 public class Worker : BackgroundService
 {
-    IConfiguration _configuration;
+    private readonly IConfiguration _configuration;
     private readonly ILogger<Worker> _logger;
-    private IConnection _connection;
-    private IChannel _channel;
-    public Worker(ILogger<Worker> logger, IConfiguration configuration)
+    private readonly IServiceProvider _serviceProvider;
+    private IConnection? _connection;
+    private IChannel? _channel;
+
+    public Worker(ILogger<Worker> logger, IConfiguration configuration, IServiceProvider serviceProvider)
     {
         _logger = logger;
         _configuration = configuration;
+        _serviceProvider = serviceProvider ?? throw new ArgumentNullException(nameof(serviceProvider));
+    }
+
+    public override async Task StartAsync(CancellationToken cancellationToken)
+    {
         ConnectionFactory factory = new ConnectionFactory
         {
             HostName = _configuration["RabbitMQ:Host"] ?? "localhost",
@@ -23,65 +37,134 @@ public class Worker : BackgroundService
             Password = _configuration["RabbitMQ:Password"] ?? "guest"
         };
 
-        _connection = factory.CreateConnectionAsync().GetAwaiter().GetResult();
-        _channel = _connection.CreateChannelAsync().GetAwaiter().GetResult();
-    }
-    public override async Task StartAsync(CancellationToken cancellationToken)
-    {
-        string QueueName = _configuration["RabbitMQ:QueueName"] ?? "queue";
+        _connection = await factory.CreateConnectionAsync(cancellationToken);
+        _channel = await _connection.CreateChannelAsync(cancellationToken: cancellationToken);
+
+        string queueName = _configuration["RabbitMQ:QueueName"] ?? "queue";
+        string dlxExchange = "dlx.exchange";
+        string dlxQueue = queueName + ".dead";
+        string dlxRoutingKey = queueName + ".dead";
+
+        await _channel.ExchangeDeclareAsync(dlxExchange, ExchangeType.Direct, durable: true, cancellationToken: cancellationToken);
+        await _channel.QueueDeclareAsync(dlxQueue, durable: true, exclusive: false, autoDelete: false, arguments: null, cancellationToken: cancellationToken);
+        await _channel.QueueBindAsync(dlxQueue, dlxExchange, dlxRoutingKey, cancellationToken: cancellationToken);
+
+        var mainQueueArguments = new Dictionary<string, object?>
+        {
+            { "x-dead-letter-exchange", dlxExchange },
+            { "x-dead-letter-routing-key", dlxRoutingKey }
+        };
+
         await _channel.QueueDeclareAsync(
-            queue: QueueName,
+            queue: queueName,
             durable: true,
             exclusive: false,
             autoDelete: false,
-            arguments: null,
+            arguments: mainQueueArguments,
             cancellationToken: cancellationToken
         );
 
-        _logger.LogInformation("Connected to RabbitMQ and listening on '{QueueName}'...", QueueName);
+        await _channel.BasicQosAsync(prefetchSize: 0, prefetchCount: 1, global: false, cancellationToken: cancellationToken);
+
+        _logger.LogInformation("Connected to RabbitMQ and listening on '{QueueName}'...", queueName);
         await base.StartAsync(cancellationToken);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        string QueueName = _configuration["RabbitMQ:QueueName"] ?? "queue";
-
+        string queueName = _configuration["RabbitMQ:QueueName"] ?? "queue";
         stoppingToken.ThrowIfCancellationRequested();
 
-        AsyncEventingBasicConsumer consumer = new AsyncEventingBasicConsumer(_channel);
+        AsyncEventingBasicConsumer consumer = new AsyncEventingBasicConsumer(_channel!);
+
         consumer.ReceivedAsync += async (model, ea) =>
         {
             byte[] body = ea.Body.ToArray();
             string message = Encoding.UTF8.GetString(body);
-            try
-            {
-                _logger.LogInformation("Message received: {Message}", message);
 
-                await _channel.BasicAckAsync(deliveryTag: ea.DeliveryTag, multiple: false, cancellationToken: stoppingToken);
-            }
-            catch (Exception ex)
+            using (var scope = _serviceProvider.CreateScope())
             {
-                _logger.LogError(ex, "Error processing RabbitMQ message.");
+                AppDbContext context = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+                IFileStorageService fileStorageService = scope.ServiceProvider.GetRequiredService<IFileStorageService>();
 
-                await _channel.BasicNackAsync(deliveryTag: ea.DeliveryTag, multiple: false, requeue: true, cancellationToken: stoppingToken);
+                try
+                {
+                    SubmissionProcessingMessage submissionProcessingMessage = JsonSerializer.Deserialize<SubmissionProcessingMessage>(message)!;
+
+                    ProcessingJob? processingJob = context.ProcessingJob
+                        .FirstOrDefault(job => job.CorrelationId == submissionProcessingMessage.CorrelationId);
+
+                    if (processingJob == null)
+                    {
+                        _logger.LogWarning("Job not found for CorrelationId: {CorrelationId}. Dropping message.", submissionProcessingMessage.CorrelationId);
+
+                        await _channel!.BasicAckAsync(ea.DeliveryTag, multiple: false);
+                        return;
+                    }
+
+                    processingJob.StartedTime = DateHelper.Now();
+
+                    if (processingJob.Attempts >= 3)
+                    {
+                        _logger.LogError("Max attempts reached for Job ID: {JobId}. Moving to DLX.", processingJob.Id);
+                        processingJob.Status = GlobalEnums.ProcessingJobStatus.Failed;
+                        processingJob.CompletedTime = DateHelper.Now();
+                        await context.SaveChangesAsync();
+
+                        await _channel!.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: false);
+                        return;
+                    }
+
+                    processingJob.Attempts += 1;
+                    processingJob.Status = GlobalEnums.ProcessingJobStatus.Processing;
+                    await context.SaveChangesAsync();
+
+                    SubmissionFileMetaData? fileMetaData = context.SubmissionFileMetaData
+                        .FirstOrDefault(file => file.Id == submissionProcessingMessage.FileId);
+
+                    if (fileMetaData == null)
+                    {
+                        processingJob.Status = GlobalEnums.ProcessingJobStatus.Failed;
+                        processingJob.CompletedTime = DateHelper.Now();
+                        await context.SaveChangesAsync();
+
+                        await _channel!.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: false);
+                        return;
+                    }
+
+                    using (FileStream fileStream = await fileStorageService.OpenReadAsync(fileMetaData.GeneratedStorageName))
+                    {
+                        string newCheckSum = CheckSumHelper.GetFileChecksum(fileStream);
+                        _logger.LogInformation("Original checksum: {Orig}. New checksum: {New}", fileMetaData.Checksum, newCheckSum);
+
+                        if (newCheckSum == fileMetaData.Checksum)
+                        {
+                            _logger.LogError("Checksum mismatch for File ID: {FileId}", fileMetaData.Id);
+                            processingJob.Status = GlobalEnums.ProcessingJobStatus.Failed;
+                            processingJob.CompletedTime = DateHelper.Now();
+                            await context.SaveChangesAsync();
+
+                            await _channel!.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: true);
+                            return;
+                        }
+                    }
+
+                    _logger.LogInformation("Message successfully processed: {Message}", message);
+
+                    processingJob.CompletedTime = DateHelper.Now();
+                    processingJob.Status = GlobalEnums.ProcessingJobStatus.Completed;
+                    await context.SaveChangesAsync();
+
+                    await _channel!.BasicAckAsync(ea.DeliveryTag, multiple: false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Unexpected crash processing message. Requeuing to main queue.");
+                    await _channel!.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: true);
+                }
             }
         };
-        await _channel.BasicConsumeAsync(
-                queue: QueueName,
-                autoAck: false, // Set to false to enforce explicit manual ACKs
-                consumer: consumer,
-                cancellationToken: stoppingToken
-            );
 
-        // Keep the background process alive while the service runs
-        await Task.Delay(Timeout.Infinite, stoppingToken);
-    }
-    public override async Task StopAsync(CancellationToken cancellationToken)
-    {
-        // 8. Safely dispose channels and connections upon application termination
-        if (_channel is { IsOpen: true }) await _channel.CloseAsync(cancellationToken);
-        if (_connection is { IsOpen: true }) await _connection.CloseAsync(cancellationToken);
-
-        await base.StopAsync(cancellationToken);
+        await _channel!.BasicConsumeAsync(queue: queueName, autoAck: false, consumer: consumer, cancellationToken: stoppingToken);
     }
 }

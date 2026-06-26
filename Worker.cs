@@ -81,7 +81,7 @@ public class Worker : BackgroundService
         {
             byte[] body = ea.Body.ToArray();
             string message = Encoding.UTF8.GetString(body);
-
+            _logger.LogInformation("Message consumed");
             using (var scope = _serviceProvider.CreateScope())
             {
                 AppDbContext context = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -108,6 +108,7 @@ public class Worker : BackgroundService
                     {
                         _logger.LogError("Max attempts reached for Job ID: {JobId}. Moving to DLX.", processingJob.Id);
                         processingJob.Status = GlobalEnums.ProcessingJobStatus.Failed;
+                        _logger.LogInformation("Processing Job status changed to Failed, ProcessingJobId: {}",processingJob.Id);
                         processingJob.CompletedTime = DateHelper.Now();
                         await context.SaveChangesAsync();
 
@@ -117,6 +118,7 @@ public class Worker : BackgroundService
 
                     processingJob.Attempts += 1;
                     processingJob.Status = GlobalEnums.ProcessingJobStatus.Processing;
+                    _logger.LogInformation("Processing Job status changed to Processing, ProcessingJobId: {}",processingJob.Id);
                     await context.SaveChangesAsync();
 
                     SubmissionFileMetaData? fileMetaData = context.SubmissionFileMetaData
@@ -125,6 +127,7 @@ public class Worker : BackgroundService
                     if (fileMetaData == null)
                     {
                         processingJob.Status = GlobalEnums.ProcessingJobStatus.Failed;
+                        _logger.LogInformation("Processing Job status changed to Failed, ProcessingJobId: {}",processingJob.Id);
                         processingJob.CompletedTime = DateHelper.Now();
                         await context.SaveChangesAsync();
 
@@ -141,6 +144,7 @@ public class Worker : BackgroundService
                         {
                             _logger.LogError("Checksum mismatch for File ID: {FileId}", fileMetaData.Id);
                             processingJob.Status = GlobalEnums.ProcessingJobStatus.Failed;
+                            _logger.LogInformation("Processing Job status changed to Failed, ProcessingJobId: {}",processingJob.Id);
                             processingJob.CompletedTime = DateHelper.Now();
                             await context.SaveChangesAsync();
 
@@ -153,6 +157,7 @@ public class Worker : BackgroundService
 
                     processingJob.CompletedTime = DateHelper.Now();
                     processingJob.Status = GlobalEnums.ProcessingJobStatus.Completed;
+                    _logger.LogInformation("Processing Job status changed to Completed, ProcessingJobId: {}",processingJob.Id);
                     await context.SaveChangesAsync();
 
                     await _channel!.BasicAckAsync(ea.DeliveryTag, multiple: false);

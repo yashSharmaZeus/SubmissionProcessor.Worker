@@ -16,14 +16,16 @@ public class Worker : BackgroundService
     private readonly IConfiguration _configuration;
     private readonly ILogger<Worker> _logger;
     private readonly IServiceProvider _serviceProvider;
+    private readonly ICallerService _callerService;
     private IConnection? _connection;
     private IChannel? _channel;
 
-    public Worker(ILogger<Worker> logger, IConfiguration configuration, IServiceProvider serviceProvider)
+    public Worker(ILogger<Worker> logger, IConfiguration configuration, IServiceProvider serviceProvider, ICallerService callerService)
     {
         _logger = logger;
         _configuration = configuration;
         _serviceProvider = serviceProvider ?? throw new ArgumentNullException(nameof(serviceProvider));
+        _callerService = callerService;
     }
 
     public override async Task StartAsync(CancellationToken cancellationToken)
@@ -108,7 +110,7 @@ public class Worker : BackgroundService
                     {
                         _logger.LogError("Max attempts reached for Job ID: {JobId}. Moving to DLX.", processingJob.Id);
                         processingJob.Status = GlobalEnums.ProcessingJobStatus.Failed;
-                        _logger.LogInformation("Processing Job status changed to Failed, ProcessingJobId: {}",processingJob.Id);
+                        _logger.LogInformation("Processing Job status changed to Failed, ProcessingJobId: {}", processingJob.Id);
                         processingJob.CompletedTime = DateHelper.Now();
                         await context.SaveChangesAsync();
 
@@ -118,7 +120,7 @@ public class Worker : BackgroundService
 
                     processingJob.Attempts += 1;
                     processingJob.Status = GlobalEnums.ProcessingJobStatus.Processing;
-                    _logger.LogInformation("Processing Job status changed to Processing, ProcessingJobId: {}",processingJob.Id);
+                    _logger.LogInformation("Processing Job status changed to Processing, ProcessingJobId: {}", processingJob.Id);
                     await context.SaveChangesAsync();
 
                     SubmissionFileMetaData? fileMetaData = context.SubmissionFileMetaData
@@ -127,7 +129,7 @@ public class Worker : BackgroundService
                     if (fileMetaData == null)
                     {
                         processingJob.Status = GlobalEnums.ProcessingJobStatus.Failed;
-                        _logger.LogInformation("Processing Job status changed to Failed, ProcessingJobId: {}",processingJob.Id);
+                        _logger.LogInformation("Processing Job status changed to Failed, ProcessingJobId: {}", processingJob.Id);
                         processingJob.CompletedTime = DateHelper.Now();
                         await context.SaveChangesAsync();
 
@@ -138,13 +140,12 @@ public class Worker : BackgroundService
                     using (FileStream fileStream = await fileStorageService.OpenReadAsync(fileMetaData.GeneratedStorageName))
                     {
                         string newCheckSum = CheckSumHelper.GetFileChecksum(fileStream);
-                        _logger.LogInformation("Original checksum: {Orig}. New checksum: {New}", fileMetaData.Checksum, newCheckSum);
 
-                        if (newCheckSum == fileMetaData.Checksum)
+                        if (newCheckSum != fileMetaData.Checksum)
                         {
                             _logger.LogError("Checksum mismatch for File ID: {FileId}", fileMetaData.Id);
                             processingJob.Status = GlobalEnums.ProcessingJobStatus.Failed;
-                            _logger.LogInformation("Processing Job status changed to Failed, ProcessingJobId: {}",processingJob.Id);
+                            _logger.LogInformation("Processing Job status changed to Failed, ProcessingJobId: {}", processingJob.Id);
                             processingJob.CompletedTime = DateHelper.Now();
                             await context.SaveChangesAsync();
 
@@ -157,10 +158,24 @@ public class Worker : BackgroundService
 
                     processingJob.CompletedTime = DateHelper.Now();
                     processingJob.Status = GlobalEnums.ProcessingJobStatus.Completed;
-                    _logger.LogInformation("Processing Job status changed to Completed, ProcessingJobId: {}",processingJob.Id);
+                    _logger.LogInformation("Processing Job status changed to Completed, ProcessingJobId: {}", processingJob.Id);
                     await context.SaveChangesAsync();
 
                     await _channel!.BasicAckAsync(ea.DeliveryTag, multiple: false);
+                    using HttpResponseMessage response = await _callerService.GetById(processingJob.CorrelationId);
+
+                    string content = await response.Content.ReadAsStringAsync(stoppingToken);
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        _logger.LogInformation("Success! Status Code: {StatusCode}. Response data: {Data}",
+                            response.StatusCode, content);
+                    }
+                    else
+                    {
+                        _logger.LogWarning("Request failed with Status Code: {StatusCode}. Reason/Error: {Error}",
+                            response.StatusCode, content);
+                    }
                 }
                 catch (Exception ex)
                 {

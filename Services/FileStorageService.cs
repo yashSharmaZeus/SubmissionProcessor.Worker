@@ -10,7 +10,7 @@ public class FileStorageService : IFileStorageService
 
     public FileStorageService(IConfiguration configuration, ILogger<FileStorageService> logger, AppDbContext context)
     {
-        _storageRoot = configuration["FileStorageSettings: StorageRoot"] ?? "../TraineeManagement.Api/Storage";
+        _storageRoot = configuration["FileStorageSettings: StorageRoot"] ?? "./Storage";
         Directory.CreateDirectory(_storageRoot);
         _logger = logger;
         _context = context;
@@ -18,6 +18,7 @@ public class FileStorageService : IFileStorageService
 
     public string getFullPath(string fileName)
     {
+        _logger.LogInformation(Path.Combine(_storageRoot, fileName));
         return Path.Combine(_storageRoot, fileName);
     }
 

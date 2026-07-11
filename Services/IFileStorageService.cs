@@ -1,5 +1,3 @@
-using SubmissionProcessor.Worker.Models;
-
 namespace SubmissionProcessor.Worker.Services;
 
 public interface IFileStorageService

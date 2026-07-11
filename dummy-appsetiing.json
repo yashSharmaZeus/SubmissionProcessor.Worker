@@ -1,0 +1,23 @@
+{
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.Hosting.Lifetime": "Information"
+    }
+  },
+  "ConnectionStrings": {
+    "DefaultConnection": "server=YOUR_SERVER;port=3306;database=YOUR_DATABASE;user=YOUR_USERNAME;password=YOUR_PASSWORD;",
+    "Redis": "YOUR_REDIS_HOST:6379,password=YOUR_REDIS_PASSWORD"
+  },
+  "FileStorageSettings": {
+    "StorageRoot": "PATH_TO_STORAGE_FOLDER"
+  },
+  "RabbitMQ": {
+    "Host": "YOUR_RABBITMQ_HOST",
+    "Port": 5672,
+    "VirtualHost": "YOUR_VIRTUAL_HOST",
+    "Username": "YOUR_USERNAME",
+    "Password": "YOUR_PASSWORD",
+    "QueueName": "YOUR_QUEUE_NAME"
+  }
+}
